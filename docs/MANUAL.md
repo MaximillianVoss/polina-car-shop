@@ -62,7 +62,9 @@ VITE_API_BASE_URL=http://127.0.0.1:4174/ npm run dev
 
 `createApi(base, transport)` принимает адрес и необязательный fetch. Такая зависимость позволяет проверять запросы без обращения к общему серверу. `endpoint(id?)` строит URL на выбранном base; id кодируется в сегмент пути. HAL-ссылки старого сервера не заставляют приложение менять host.
 
-`request` ставит Accept, а при JSON-теле — Content-Type. Тайм-аут 15 секунд ограничивает ожидание. Проверка response.ok превращает HTTP-ошибку в исключение. Ошибка сети имеет понятное сообщение. Запросы изменения не повторяются автоматически: при потере ответа данные могли уже измениться на сервере.
+`request` ставит Accept, а при JSON-теле — Content-Type. AbortController и таймер ограничивают ожидание 30 секундами, включая чтение JSON; поддержка AbortSignal.timeout не требуется. Проверка response.ok превращает HTTP-ошибку в исключение. Тайм-аут, неверный JSON и ошибка подключения имеют разные сообщения. Запросы изменения не повторяются автоматически: при потере ответа данные могли уже измениться на сервере.
+
+На localhost браузер обращается к `/api/cars` своего приложения. Proxy в `vite.config.ts` пересылает запрос в настоящий учебный backend: работает и `npm run dev`, и `npm run preview`/общий build-and-run.sh. Это устраняет прямой междоменный запрос из браузера, не подменяет данные и не отключает проверку TLS. Адрес внешнего сервера остаётся VITE_API_BASE_URL; custom API-prefix и параметры pagination сохраняются. При сбое сервер возвращает код ENOTFOUND/ECONNREFUSED и т.п., который показывается в интерфейсе. Для статического хостинга без Vite нужен собственный `/api` proxy либо обычный прямой HTTPS API; при нелокальном адресе приложение по умолчанию использует прямой backend.
 
 `parse(raw)` проверяет типы полей и извлекает id из self.href, затем car.href, затем числового id. Чужие служебные поля не попадут в запрос. Некорректная машина или повторяющиеся id отклоняются, чтобы нельзя было молча отредактировать чужую запись.
 
@@ -150,6 +152,7 @@ E2E использует Chromium и автоматически запускае
 
 ```text
 VITE_API_BASE_URL=https://car-rest-service-carshop.2.rahtiapp.fi/
+# On localhost, Vite dev/preview forwards same-origin /api/ requests here.
 # For safe local practice instead: http://127.0.0.1:4174/
 ```
 
@@ -195,8 +198,37 @@ evidence/
 
 ```ts
 import { defineConfig } from 'vitest/config';
+import { loadEnv, type ProxyOptions } from 'vite';
 import react from '@vitejs/plugin-react';
-export default defineConfig({ plugins: [react()], test: { include: ['tests/unit/**/*.test.ts'] } });
+import { backendBase, proxyPath } from './src/api-config';
+
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), 'VITE_');
+  const target = backendBase(process.env.VITE_API_BASE_URL || env.VITE_API_BASE_URL);
+  const proxy: Record<string, ProxyOptions> = {
+    '^/api(?:/|\\?|$)': {
+      target: new URL(target).origin,
+      changeOrigin: true,
+      proxyTimeout: 25000,
+      timeout: 28000,
+      rewrite: path => proxyPath(path, target),
+      configure(instance) {
+        // The original direct fetch did not send cross-origin cookies. Keep
+        // local application cookies away from the shared course backend.
+        instance.on('proxyReq', request => request.removeHeader('cookie'));
+        instance.on('proxyRes', response => { delete response.headers['set-cookie']; });
+        instance.on('error', (error, _request, response) => {
+          if ('writeHead' in response && !response.headersSent && !response.writableEnded) {
+            const reason = (error as NodeJS.ErrnoException).code || 'NETWORK_ERROR';
+            response.writeHead(502, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+            response.end(JSON.stringify({ code: 'API_UNREACHABLE', reason }));
+          }
+        });
+      },
+    },
+  };
+  return { plugins: [react()], server: { proxy }, preview: { proxy }, test: { include: ['tests/unit/**/*.test.ts'] } };
+});
 ```
 
 ### playwright.config.ts
@@ -248,24 +280,66 @@ export function selectCars(cars: Car[], query: string, field: Field, direction: 
 }
 ```
 
+### src/api-config.ts
+
+```ts
+export const DEFAULT_BASE = 'https://car-rest-service-carshop.2.rahtiapp.fi/';
+
+export function backendBase(raw: string = DEFAULT_BASE): string {
+  const url = new URL(raw.endsWith('/') ? raw : `${raw}/`);
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error('API base must be an HTTP or HTTPS address without credentials, query or fragment.');
+  }
+  return url.href;
+}
+
+export function browserApiBase(backend: string, pageUrl?: string): string {
+  if (pageUrl) {
+    const page = new URL(pageUrl);
+    if (['localhost', '127.0.0.1', '[::1]'].includes(page.hostname)) return new URL('/api/', page.origin).href;
+  }
+  return backendBase(backend);
+}
+
+export function proxyPath(path: string, backend: string): string {
+  return new URL(backend).pathname.replace(/\/$/, '') + path.replace(/^\/api(?=\/|\?|$)/, '');
+}
+```
+
 ### src/api.ts
 
 ```ts
 import { fields, type Car, type CarInput } from './cars';
-export const DEFAULT_BASE = 'https://car-rest-service-carshop.2.rahtiapp.fi/';
-export const API_BASE = import.meta.env.VITE_API_BASE_URL || DEFAULT_BASE;
+import { DEFAULT_BASE, backendBase, browserApiBase } from './api-config';
+export { DEFAULT_BASE };
+export const BACKEND_BASE = backendBase(import.meta.env.VITE_API_BASE_URL || DEFAULT_BASE);
+export const API_BASE = browserApiBase(BACKEND_BASE, typeof location === 'undefined' ? undefined : location.href);
+export const REQUEST_TIMEOUT_MS = 30000;
+class ApiRequestError extends Error {}
 export function createApi(base: string, transport: typeof fetch = fetch) {
-  const root = new URL(base.endsWith('/') ? base : `${base}/`);
-  if (!['http:', 'https:'].includes(root.protocol)) throw new Error('API base must use HTTP or HTTPS.');
+  const root = new URL(backendBase(base));
   const endpoint = (id?: string) => new URL(`cars${id ? `/${encodeURIComponent(id)}` : ''}`, root).href;
-  async function request(url: string, init?: RequestInit) {
+  async function request(url: string, init?: RequestInit, json = false): Promise<unknown> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const warning = init?.method && init.method !== 'GET' ? ' A timed-out change may have reached the server: refresh before retrying.' : '';
     try {
-      const response = await transport(url, { ...init, signal: AbortSignal.timeout(15000), headers: { Accept: 'application/hal+json, application/json', ...(init?.body ? { 'Content-Type': 'application/json' } : {}) } });
-      if (!response.ok) throw new Error(`Server returned ${response.status}. ${response.status === 404 ? 'The car may have been removed. Refresh the list.' : 'Please try again.'}`);
-      return response;
+      const response = await transport(url, { ...init, signal: controller.signal, headers: { Accept: 'application/hal+json, application/json', ...(init?.body ? { 'Content-Type': 'application/json' } : {}) } });
+      if (!response.ok) {
+        if (response.status === 502 && response.headers.get('content-type')?.includes('application/json')) {
+          const detail = await response.json().catch(() => null) as { code?: string; reason?: string } | null;
+          if (detail?.code === 'API_UNREACHABLE') throw new ApiRequestError(`Cannot reach the course API from the local server (${detail.reason || 'network error'}). Check internet access or VPN and try again.${warning}`);
+        }
+        throw new ApiRequestError(`Server returned ${response.status}. ${response.status === 404 ? 'The car may have been removed. Refresh the list.' : 'Please try again.'}`);
+      }
+      return json ? await response.json() : undefined;
     } catch (error) {
-      if (error instanceof Error && error.message.startsWith('Server returned')) throw error;
-      throw new Error('Cannot reach the API. Check the connection and API base URL. A timed-out change may have reached the server: refresh before retrying.');
+      if (error instanceof ApiRequestError) throw error;
+      if (controller.signal.aborted) throw new Error(`The API did not respond within ${REQUEST_TIMEOUT_MS / 1000} seconds. Try again.${warning}`);
+      if (error instanceof SyntaxError) throw new Error('The API returned invalid JSON. Check the API base URL.');
+      throw new Error(`Cannot reach the API at ${root.origin}. Check the connection and API base URL.${warning}`);
+    } finally {
+      clearTimeout(timer);
     }
   }
   function parse(raw: unknown): Car {
@@ -286,7 +360,7 @@ export function createApi(base: string, transport: typeof fetch = fetch) {
       while (next) {
         if (seen.has(next) || seen.size >= 100) throw new Error('Invalid API pagination.');
         seen.add(next);
-        const data = await (await request(next)).json();
+        const data = await request(next, undefined, true) as { _embedded?: { cars?: unknown[] }; _links?: { next?: { href?: string } } } | null;
         if (!Array.isArray(data?._embedded?.cars)) throw new Error('Invalid API response: expected _embedded.cars.');
         cars.push(...data._embedded.cars.map(parse));
         const href: string | undefined = data?._links?.next?.href;
@@ -324,7 +398,7 @@ createRoot(document.getElementById('root')!).render(<React.StrictMode><QueryClie
 ```tsx
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api, API_BASE } from './api';
+import { api, BACKEND_BASE } from './api';
 import { draftOf, fields, labels, selectCars, validate, type Car, type CarInput, type Field } from './cars';
 
 function Modal({ title, busy, close, children }: { title: string; busy: boolean; close: () => void; children: ReactNode }) {
@@ -378,7 +452,7 @@ export default function App() {
     <header><div className="header-inner"><span className="logo" aria-hidden="true">CS</span><div><p className="eyebrow">THE SHOWROOM</p><h1>Car Shop</h1></div><span className="header-tag">Inventory workspace</span></div></header>
     <main>
       <section className="heading"><div><p className="eyebrow">STOCK MANAGEMENT</p><h2>Your next drive starts here.</h2><p className="muted">Browse the collection. Keep every detail up to date.</p></div><button className="primary" disabled={busy} onClick={() => openEditor()}>+ Add car</button></section>
-      <p className="environment">{API_BASE.startsWith('http://127.0.0.1') || API_BASE.startsWith('http://localhost') ? 'Local practice backend' : 'Connected to shared course backend — saved changes affect its inventory.'}</p>
+      <p className="environment">{BACKEND_BASE.startsWith('http://127.0.0.1') || BACKEND_BASE.startsWith('http://localhost') ? 'Local practice backend' : `${list.isSuccess ? 'Connected to' : 'Using'} shared course backend — saved changes affect its inventory.`}</p>
       <section className="inventory" aria-label="Car inventory">
         <div className="toolbar"><div className="search"><label htmlFor="search">Search cars</label><input id="search" type="search" placeholder="Brand, model, color, fuel, year or price" value={query} onChange={event => setQuery(event.target.value)}/></div><div><label htmlFor="sort">Sort by</label><select id="sort" value={sort} onChange={event => setSort(event.target.value as Field)}>{fields.map(key => <option key={key} value={key}>{labels[key]}</option>)}</select></div><button aria-label={`Sort ${direction === 'asc' ? 'descending' : 'ascending'}`} onClick={() => setDirection(direction === 'asc' ? 'desc' : 'asc')}>{direction === 'asc' ? '↑ Ascending' : '↓ Descending'}</button><button disabled={list.isFetching || busy} onClick={() => { setNotice(''); void list.refetch(); }}>Refresh</button></div>
         <div className="list-status" aria-live="polite">{list.isFetching ? 'Loading inventory…' : `${cars.length} of ${list.data?.length ?? 0} cars`}{notice && <span className="success">{notice}</span>}</div>
@@ -461,26 +535,35 @@ console.log(JSON.stringify(evidence));
 
 ```js
 import { chromium } from '@playwright/test';
-import { writeFile } from 'node:fs/promises';
+import { writeFile, mkdir } from 'node:fs/promises';
+const pageUrl = process.env.CARSHOP_CHECK_PAGE || 'http://127.0.0.1:4176/';
+const origin = new URL(pageUrl).origin;
 const browser = await chromium.launch();
 try {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-  const requests = [], errors = [];
+  const requests = [], errors = [], failures = [];
+  page.on('request', request => {
+    if (request.url().startsWith(`${origin}/api/`)) {
+      requests.push({ method: request.method(), url: request.url() });
+      if (request.method() !== 'GET') errors.push('Read-only check forbids mutations');
+    }
+  });
+  page.on('requestfailed', request => failures.push({ url: request.url(), error: request.failure()?.errorText }));
   page.on('pageerror', error => errors.push(error.message));
   page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
   await page.route('https://car-rest-service-carshop.2.rahtiapp.fi/**', async route => {
-    requests.push({ method: route.request().method(), url: route.request().url() });
-    if (route.request().method() !== 'GET') throw new Error('Read-only check forbids remote mutations');
-    await route.continue();
+    errors.push('The local app attempted a direct browser request to the remote API.');
+    await route.abort('blockedbyclient');
   });
-  await page.goto('http://127.0.0.1:4176/');
-  await page.locator('tbody tr').first().waitFor({ timeout: 30000 });
+  await page.goto(pageUrl);
+  await page.locator('tbody tr').first().waitFor({ timeout: 35000 });
   const count = await page.locator('tbody tr').count();
   await page.getByLabel('Search cars').fill('volvo');
   const filteredCount = await page.locator('tbody tr').count();
-  if (!filteredCount || filteredCount > count || errors.length) throw new Error(`Live UI failure: ${JSON.stringify({ count, filteredCount, errors })}`);
+  if (!filteredCount || filteredCount > count || !requests.length || errors.length || failures.length) throw new Error(`Live UI failure: ${JSON.stringify({ count, filteredCount, errors, failures })}`);
+  await mkdir('evidence', { recursive: true });
   await page.screenshot({ path: 'evidence/live-browser.png', fullPage: true });
-  const evidence = { checkedAt: new Date().toISOString(), mode: 'read-only', count, filteredCount, requests, errors, remoteMutationsTested: false };
+  const evidence = { checkedAt: new Date().toISOString(), mode: 'read-only through same-origin local proxy', count, filteredCount, requests, errors, failures, directBrowserApiBlocked: true, remoteMutationsTested: false };
   await writeFile('evidence/live-browser.json', JSON.stringify(evidence, null, 2));
   console.log(JSON.stringify(evidence));
 } finally { await browser.close(); }
@@ -526,7 +609,7 @@ console.log(JSON.stringify(receipt));
 ```js
 import { readFile, writeFile } from 'node:fs/promises';
 const intro = await readFile('docs/MANUAL-INTRO.md', 'utf8');
-const files = ['package.json','.env.example','.gitignore','index.html','public/favicon.svg','tsconfig.json','vite.config.ts','playwright.config.ts','src/cars.ts','src/api.ts','src/main.tsx','src/App.tsx','src/styles.css','scripts/mock-server.mjs','scripts/check-live.mjs','scripts/check-live-browser.mjs','scripts/package.mjs','scripts/prepare-manual.mjs','tests/unit/api.test.ts','tests/unit/cars.test.ts','tests/e2e/inventory.spec.ts'];
+const files = ['package.json','.env.example','.gitignore','index.html','public/favicon.svg','tsconfig.json','vite.config.ts','playwright.config.ts','src/cars.ts','src/api-config.ts','src/api.ts','src/main.tsx','src/App.tsx','src/styles.css','scripts/mock-server.mjs','scripts/check-live.mjs','scripts/check-live-browser.mjs','scripts/package.mjs','scripts/prepare-manual.mjs','tests/unit/api.test.ts','tests/unit/connection.test.ts','tests/unit/cars.test.ts','tests/e2e/inventory.spec.ts'];
 let result = intro + '\n\n## Полные авторские листинги\n\nЛистинги ниже взяты из файлов этой версии автоматически. Зависимости из node_modules и машинный package-lock.json не перепечатываются; lockfile находится в архиве и фиксирует установку. Изменили код — обновите руководство командой `node scripts/prepare-manual.mjs`.\n';
 for (const file of files) {
   const language = file.endsWith('.tsx') ? 'tsx' : file.endsWith('.ts') ? 'ts' : file.endsWith('.mjs') ? 'js' : file.endsWith('.json') ? 'json' : file.endsWith('.css') ? 'css' : file.endsWith('.html') ? 'html' : 'text';
@@ -580,6 +663,74 @@ describe('HAL and CRUD contracts', () => {
 });
 ```
 
+### tests/unit/connection.test.ts
+
+```ts
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { backendBase, browserApiBase, DEFAULT_BASE, proxyPath } from '../../src/api-config';
+import { createApi, REQUEST_TIMEOUT_MS } from '../../src/api';
+
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+
+describe('local API connection', () => {
+  it.each(['http://127.0.0.1:4173/', 'http://localhost:5173/', 'http://[::1]:4173/'])('uses the current local origin for %s', page => {
+    expect(browserApiBase(DEFAULT_BASE, page)).toBe(new URL('/api/', page).href);
+  });
+  it('preserves the configured backend for static hosting and nonbrowser tools', () => {
+    expect(browserApiBase('https://backend.example/v1/', 'https://student.example/shop/')).toBe('https://backend.example/v1/');
+    expect(browserApiBase(DEFAULT_BASE)).toBe(DEFAULT_BASE);
+  });
+  it('preserves custom target prefix, car ID and pagination query when proxying', () => {
+    expect(proxyPath('/api/cars/42', 'https://backend.example/v1/')).toBe('/v1/cars/42');
+    expect(proxyPath('/api/cars?page=2&size=10', DEFAULT_BASE)).toBe('/cars?page=2&size=10');
+  });
+  it.each(['file:///tmp/db', 'https://user:password@backend.example/', 'https://backend.example/?token=x'])('rejects invalid backend configuration %s', value => {
+    expect(() => backendBase(value)).toThrow('API base');
+  });
+  it('does not depend on AbortSignal.timeout browser support', async () => {
+    vi.spyOn(AbortSignal, 'timeout').mockImplementation(() => { throw new TypeError('Not supported'); });
+    const transport = vi.fn<typeof fetch>().mockResolvedValue(new Response('{"_embedded":{"cars":[]}}'));
+    expect(await createApi('https://backend.example/', transport).list()).toEqual([]);
+  });
+  it('shows the local server network reason instead of a generic status 502', async () => {
+    const transport = vi.fn<typeof fetch>().mockResolvedValue(new Response('{"code":"API_UNREACHABLE","reason":"ENOTFOUND"}', { status: 502, headers: { 'Content-Type': 'application/json' } }));
+    await expect(createApi('http://localhost:4173/api/', transport).list()).rejects.toThrow('ENOTFOUND');
+  });
+  it('distinguishes invalid JSON from failure to connect', async () => {
+    const transport = vi.fn<typeof fetch>().mockResolvedValue(new Response('<html>Wrong server</html>'));
+    await expect(createApi('https://backend.example/', transport).list()).rejects.toThrow('invalid JSON');
+  });
+  it('does not show mutation uncertainty for a failed read', async () => {
+    const transport = vi.fn<typeof fetch>().mockRejectedValue(new TypeError('Failed to fetch'));
+    await expect(createApi('https://backend.example/', transport).list()).rejects.not.toThrow('change may');
+    await expect(createApi('https://backend.example/', transport).remove('42')).rejects.toThrow('change may');
+  });
+  it('aborts slow mutations once and reports uncertainty without retrying', async () => {
+    vi.useFakeTimers();
+    const transport = vi.fn<typeof fetch>().mockImplementation((_url, options) => new Promise((_resolve, reject) => {
+      options?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+    }));
+    const result = expect(createApi('https://backend.example/', transport).remove('42')).rejects.toThrow('30 seconds');
+    await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS);
+    await result;
+    expect(transport).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('keeps the timeout active while reading the response body', async () => {
+    vi.useFakeTimers();
+    const transport = vi.fn<typeof fetch>().mockImplementation(async (_url, options) => {
+      const response = new Response('{}');
+      response.json = () => new Promise((_resolve, reject) => options?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError'))));
+      return response;
+    });
+    const result = expect(createApi('https://backend.example/', transport).list()).rejects.toThrow('30 seconds');
+    await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS);
+    await result;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+```
+
 ### tests/unit/cars.test.ts
 
 ```ts
@@ -614,7 +765,7 @@ it('rejects blank fields, negative/nonfinite price, fractional and impossible ye
 
 ```ts
 import { test, expect, type Page } from '@playwright/test';
-const local = 'http://127.0.0.1:4174/cars';
+const local = 'http://127.0.0.1:4175/api/cars';
 async function fill(page: Page) {
   for (const [name,value] of Object.entries({Brand:'Practice',Model:'Roadster',Color:'Blue',Fuel:'Electric',Year:'2024',Price:'12500.5'})) await page.getByRole('dialog').getByLabel(name, {exact:true}).fill(value);
 }

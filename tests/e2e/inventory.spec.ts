@@ -1,5 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
-const local = 'http://127.0.0.1:4174/cars';
+const local = 'http://127.0.0.1:4175/api/cars';
 async function fill(page: Page) {
   for (const [name,value] of Object.entries({Brand:'Practice',Model:'Roadster',Color:'Blue',Fuel:'Electric',Year:'2024',Price:'12500.5'})) await page.getByRole('dialog').getByLabel(name, {exact:true}).fill(value);
 }

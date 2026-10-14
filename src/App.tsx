@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api, API_BASE } from './api';
+import { api, BACKEND_BASE } from './api';
 import { draftOf, fields, labels, selectCars, validate, type Car, type CarInput, type Field } from './cars';
 
 function Modal({ title, busy, close, children }: { title: string; busy: boolean; close: () => void; children: ReactNode }) {
@@ -54,7 +54,7 @@ export default function App() {
     <header><div className="header-inner"><span className="logo" aria-hidden="true">CS</span><div><p className="eyebrow">THE SHOWROOM</p><h1>Car Shop</h1></div><span className="header-tag">Inventory workspace</span></div></header>
     <main>
       <section className="heading"><div><p className="eyebrow">STOCK MANAGEMENT</p><h2>Your next drive starts here.</h2><p className="muted">Browse the collection. Keep every detail up to date.</p></div><button className="primary" disabled={busy} onClick={() => openEditor()}>+ Add car</button></section>
-      <p className="environment">{API_BASE.startsWith('http://127.0.0.1') || API_BASE.startsWith('http://localhost') ? 'Local practice backend' : 'Connected to shared course backend — saved changes affect its inventory.'}</p>
+      <p className="environment">{BACKEND_BASE.startsWith('http://127.0.0.1') || BACKEND_BASE.startsWith('http://localhost') ? 'Local practice backend' : `${list.isSuccess ? 'Connected to' : 'Using'} shared course backend — saved changes affect its inventory.`}</p>
       <section className="inventory" aria-label="Car inventory">
         <div className="toolbar"><div className="search"><label htmlFor="search">Search cars</label><input id="search" type="search" placeholder="Brand, model, color, fuel, year or price" value={query} onChange={event => setQuery(event.target.value)}/></div><div><label htmlFor="sort">Sort by</label><select id="sort" value={sort} onChange={event => setSort(event.target.value as Field)}>{fields.map(key => <option key={key} value={key}>{labels[key]}</option>)}</select></div><button aria-label={`Sort ${direction === 'asc' ? 'descending' : 'ascending'}`} onClick={() => setDirection(direction === 'asc' ? 'desc' : 'asc')}>{direction === 'asc' ? '↑ Ascending' : '↓ Descending'}</button><button disabled={list.isFetching || busy} onClick={() => { setNotice(''); void list.refetch(); }}>Refresh</button></div>
         <div className="list-status" aria-live="polite">{list.isFetching ? 'Loading inventory…' : `${cars.length} of ${list.data?.length ?? 0} cars`}{notice && <span className="success">{notice}</span>}</div>
