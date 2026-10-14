@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.local
+test-results/
+playwright-report/
+delivery/
+verification-copy/
+
+# Generated reports may include local machine paths
+evidence/
+*.tsbuildinfo
+.env.*
+!.env.example

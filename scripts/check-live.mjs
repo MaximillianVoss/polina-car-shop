@@ -1,0 +1,13 @@
+import { writeFile, mkdir } from 'node:fs/promises';
+const base = process.env.CARSHOP_CHECK_BASE || 'https://car-rest-service-carshop.2.rahtiapp.fi/';
+const url = new URL('cars', base.endsWith('/') ? base : `${base}/`);
+const response = await fetch(url, { headers: { Accept: 'application/hal+json, application/json', Origin: 'http://127.0.0.1:5173' }, signal: AbortSignal.timeout(30000) });
+if (!response.ok) throw new Error(`GET failed: ${response.status}`);
+const data = await response.json();
+if (!Array.isArray(data?._embedded?.cars)) throw new Error('Expected HAL cars array');
+const valid = data._embedded.cars.every(car => ['brand','model','color','fuel'].every(k => typeof car[k] === 'string') && ['price','modelYear'].every(k => typeof car[k] === 'number') && /\/cars\/\d+\/?$/.test(new URL(car._links?.self?.href || car._links?.car?.href).pathname));
+if (!valid) throw new Error('Unexpected car fields or ID links');
+const evidence = { checkedAt: new Date().toISOString(), method: 'GET', url: url.href, status: response.status, count: data._embedded.cars.length, fieldsAndLinksValid: valid, allowOrigin: response.headers.get('access-control-allow-origin'), remoteMutationsTested: false };
+await mkdir('evidence', { recursive: true });
+await writeFile('evidence/live-read-only.json', JSON.stringify(evidence, null, 2));
+console.log(JSON.stringify(evidence));
