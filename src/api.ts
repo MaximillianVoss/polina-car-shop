@@ -1,3 +1,4 @@
+import { ApiUnavailableError, createAutoFallbackApi } from './fallback';
 import { fields, type Car, type CarInput } from './cars';
 import { DEFAULT_BASE, backendBase, browserApiBase } from './api-config';
 export { DEFAULT_BASE };
@@ -5,28 +6,30 @@ export const BACKEND_BASE = backendBase(import.meta.env.VITE_API_BASE_URL || DEF
 export const API_BASE = browserApiBase(BACKEND_BASE, typeof location === 'undefined' ? undefined : location.href);
 export const REQUEST_TIMEOUT_MS = 30000;
 class ApiRequestError extends Error {}
-export function createApi(base: string, transport: typeof fetch = fetch) {
+export function createApi(base: string, transport: typeof fetch = fetch, readTimeoutMs = REQUEST_TIMEOUT_MS) {
   const root = new URL(backendBase(base));
   const endpoint = (id?: string) => new URL(`cars${id ? `/${encodeURIComponent(id)}` : ''}`, root).href;
   async function request(url: string, init?: RequestInit, json = false): Promise<unknown> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timeoutMs = !init?.method || init.method === 'GET' ? readTimeoutMs : REQUEST_TIMEOUT_MS;
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     const warning = init?.method && init.method !== 'GET' ? ' A timed-out change may have reached the server: refresh before retrying.' : '';
     try {
       const response = await transport(url, { ...init, signal: controller.signal, headers: { Accept: 'application/hal+json, application/json', ...(init?.body ? { 'Content-Type': 'application/json' } : {}) } });
       if (!response.ok) {
         if (response.status === 502 && response.headers.get('content-type')?.includes('application/json')) {
           const detail = await response.json().catch(() => null) as { code?: string; reason?: string } | null;
-          if (detail?.code === 'API_UNREACHABLE') throw new ApiRequestError(`Cannot reach the course API from the local server (${detail.reason || 'network error'}). Check internet access or VPN and try again.${warning}`);
+          if (detail?.code === 'API_UNREACHABLE') throw new ApiUnavailableError(`Cannot reach the course API from the local server (${detail.reason || 'network error'}). Check internet access or VPN and try again.${warning}`);
         }
+        if (response.status >= 500) throw new ApiUnavailableError(`The API is unavailable (HTTP ${response.status}).${warning}`);
         throw new ApiRequestError(`Server returned ${response.status}. ${response.status === 404 ? 'The car may have been removed. Refresh the list.' : 'Please try again.'}`);
       }
       return json ? await response.json() : undefined;
     } catch (error) {
-      if (error instanceof ApiRequestError) throw error;
-      if (controller.signal.aborted) throw new Error(`The API did not respond within ${REQUEST_TIMEOUT_MS / 1000} seconds. Try again.${warning}`);
+      if (error instanceof ApiRequestError || error instanceof ApiUnavailableError) throw error;
+      if (controller.signal.aborted) throw new ApiUnavailableError(`The API did not respond within ${timeoutMs / 1000} seconds. Try again.${warning}`);
       if (error instanceof SyntaxError) throw new Error('The API returned invalid JSON. Check the API base URL.');
-      throw new Error(`Cannot reach the API at ${root.origin}. Check the connection and API base URL.${warning}`);
+      throw new ApiUnavailableError(`Cannot reach the API at ${root.origin}. Check the connection and API base URL.${warning}`);
     } finally {
       clearTimeout(timer);
     }
@@ -67,4 +70,4 @@ export function createApi(base: string, transport: typeof fetch = fetch) {
     },
   };
 }
-export const api = createApi(API_BASE);
+export const api = createAutoFallbackApi(createApi(API_BASE, fetch, 8000));

@@ -20,11 +20,12 @@ async function copy(dir) {
   }
 }
 await copy(root);
-await mkdir(join(payload, 'evidence'), { recursive: true });
 await writeFile(join(payload, 'evidence/package-manifest.json'), JSON.stringify(manifest, null, 2));
-const zip = resolve(root, 'delivery/Car Shop — проект.zip');
-const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Compress-Archive -LiteralPath $env:CARSHOP_PAYLOAD -DestinationPath $env:CARSHOP_ZIP -Force'], { env: { ...process.env, CARSHOP_PAYLOAD: payload, CARSHOP_ZIP: zip }, encoding: 'utf8' });
+const archiveName = `Car Shop — v${JSON.parse(await readFile(resolve(root, 'package.json'), 'utf8')).version}.zip`;
+const zip = resolve(root, 'delivery', archiveName);
+await rm(zip, { force: true });
+const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory($env:CARSHOP_PAYLOAD, $env:CARSHOP_ZIP, [System.IO.Compression.CompressionLevel]::Optimal, $true)'], { env: { ...process.env, CARSHOP_PAYLOAD: payload, CARSHOP_ZIP: zip }, encoding: 'utf8' });
 if (result.status !== 0) throw new Error(result.stderr);
-const receipt = { archive: 'Car Shop — проект.zip', sha256: createHash('sha256').update(await readFile(zip)).digest('hex'), fileCount: manifest.length + 1, builtAt: new Date().toISOString() };
+const receipt = { archive: archiveName, sha256: createHash('sha256').update(await readFile(zip)).digest('hex'), fileCount: manifest.length + 1, builtAt: new Date().toISOString() };
 await writeFile(resolve(root, 'delivery/receipt.json'), JSON.stringify(receipt, null, 2));
 console.log(JSON.stringify(receipt));

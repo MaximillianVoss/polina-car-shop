@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+const { version } = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
 import { test, expect, type Page } from '@playwright/test';
 const local = 'http://127.0.0.1:4175/api/cars';
 async function fill(page: Page) {
@@ -8,6 +10,7 @@ test('CRUD, validation, numeric sort, search, cancel and keyboard focus on local
   page.on('request', request => { if (!request.url().startsWith('http://127.0.0.1:') && !request.url().startsWith('data:')) remote.push(request.url()); });
   page.on('pageerror', error => errors.push(error.message));
   await page.goto('/'); await expect(page.getByText('2 of 2 cars')).toBeVisible();
+  await expect(page.locator('footer')).toContainText('v' + version);
   await page.getByLabel('Sort by').selectOption('price');
   await expect(page.locator('tbody tr').first()).toContainText('Nissan');
   await page.getByRole('button',{name:'Sort descending'}).click();
@@ -48,17 +51,18 @@ test('loading, empty list and read error with recovery', async ({page}) => {
   let mode = 'loading';
   await page.route(local, async route => {
     if (mode === 'loading') await new Promise(resolve => setTimeout(resolve,500));
-    if (mode === 'error') await route.fulfill({status:500,body:'{}'});
+    if (mode === 'error') await route.fulfill({status:403,body:'{}'});
     else await route.fulfill({contentType:'application/json',body:JSON.stringify({_embedded:{cars:[]}})});
   });
   await page.goto('/'); await expect(page.getByText('Loading inventory…')).toBeVisible();
   await expect(page.getByText('The showroom is empty',{exact:true})).toBeVisible();
   mode='error'; await page.getByRole('button',{name:'Refresh',exact:true}).click();
-  await expect(page.getByRole('alert')).toContainText('500');
+  await expect(page.getByRole('alert')).toContainText('403');
   mode='empty'; await page.getByRole('button',{name:'Try again',exact:true}).click(); await expect(page.getByRole('alert')).toHaveCount(0);
 });
 test('failed POST keeps form values; failed DELETE keeps car; busy prevents duplicate submit', async ({page}) => {
   await page.goto('/'); await expect(page.getByText('2 of 2 cars')).toBeVisible();
+  await expect(page.locator('footer')).toContainText('v' + version);
   let posts=0;
   await page.route(`${local}**`, async route => {
     if (route.request().method()==='POST') { posts++; await new Promise(resolve=>setTimeout(resolve,500)); await route.fulfill({status:500,body:'{}'}); }
@@ -75,6 +79,7 @@ test('failed POST keeps form values; failed DELETE keeps car; busy prevents dupl
 });
 test('failed PUT preserves edit form and success followed by read failure is distinct', async ({page}) => {
   await page.goto('/'); await expect(page.getByText('2 of 2 cars')).toBeVisible();
+  await expect(page.locator('footer')).toContainText('v' + version);
   await page.route(`${local}/*`, async route => {
     if (route.request().method() === 'PUT') await route.fulfill({status:500,body:'{}'});
     else await route.continue();
@@ -89,7 +94,7 @@ test('failed PUT preserves edit form and success followed by read failure is dis
   let saved = false;
   await page.route(local, async route => {
     if (route.request().method() === 'POST') { saved=true; await route.fulfill({status:201,body:'{}'}); }
-    else if (saved) await route.fulfill({status:500,body:'{}'});
+    else if (saved) await route.fulfill({status:403,body:'{}'});
     else await route.continue();
   });
   await page.getByRole('button',{name:'+ Add car',exact:true}).click(); await fill(page);
@@ -97,4 +102,44 @@ test('failed PUT preserves edit form and success followed by read failure is dis
   await expect(page.getByRole('dialog')).toHaveCount(0);
   await expect(page.getByText('Car added.',{exact:true})).toBeVisible();
   await expect(page.getByRole('alert')).toContainText('Inventory could not be refreshed.');
+});
+test('unavailable API automatically enables local demo CRUD, stays local, resets on reload', async ({page}) => {
+  const apiCalls: string[] = [];
+  await page.route(`${local}**`, async route => {
+    apiCalls.push(route.request().method());
+    await route.fulfill({status:503,body:'{}'});
+  });
+  await page.setViewportSize({width:390,height:844});
+  await page.goto('/');
+  await expect(page.getByRole('status').filter({hasText:'LOCAL DEMO'})).toBeVisible();
+  await expect(page.getByText('2 of 2 cars')).toBeVisible();
+  await page.getByRole('button',{name:'+ Add car',exact:true}).click(); await fill(page);
+  await page.getByRole('button',{name:'Save car',exact:true}).click();
+  await expect(page.getByText('3 of 3 cars')).toBeVisible();
+  await page.getByRole('button',{name:'Edit Practice Roadster',exact:true}).click();
+  await page.getByRole('dialog').getByLabel('Model',{exact:true}).fill('Local Tourer');
+  await page.getByRole('button',{name:'Save car',exact:true}).click();
+  await expect(page.getByRole('button',{name:'Edit Practice Local Tourer',exact:true})).toBeVisible();
+  await page.screenshot({path:'evidence/auto-fallback-mobile.png',fullPage:true});
+  await page.getByRole('button',{name:'Delete Practice Local Tourer',exact:true}).click();
+  await page.getByRole('button',{name:'Delete car',exact:true}).click();
+  await expect(page.getByText('2 of 2 cars')).toBeVisible();
+  await page.getByRole('button',{name:'Refresh',exact:true}).click();
+  expect(apiCalls).toEqual(['GET']);
+  await page.reload(); await expect(page.getByText('2 of 2 cars')).toBeVisible();
+  expect(apiCalls).toEqual(['GET','GET']);
+});
+test('network abort and slow read enable fallback; healthy reload returns to real API', async ({page}) => {
+  await page.route(`${local}**`, route => route.abort('failed'));
+  await page.goto('/'); await expect(page.getByRole('status').filter({hasText:'LOCAL DEMO'})).toBeVisible();
+  await page.unroute(`${local}**`);
+  await page.reload(); await expect(page.getByText('2 of 2 cars')).toBeVisible();
+  await expect(page.getByText('LOCAL DEMO',{exact:false})).toHaveCount(0);
+  await page.route(`${local}**`, async route => {
+    await new Promise(resolve => setTimeout(resolve,10000));
+    await route.fulfill({status:503,body:'{}'}).catch(() => {});
+  });
+  await page.reload();
+  await expect(page.getByRole('status').filter({hasText:'LOCAL DEMO'})).toBeVisible({timeout:12000});
+  await expect(page.getByText('2 of 2 cars')).toBeVisible();
 });
